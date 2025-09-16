@@ -1,8 +1,9 @@
-name: Require Jira Ticket (simple)
+name: Require Jira Ticket (Bash only)
 
 on:
   pull_request:
     types: [opened, edited, synchronize, reopened]
+  # merge_group:  # uncomment if you use Merge Queue
 
 permissions:
   contents: read
@@ -10,35 +11,50 @@ permissions:
 
 env:
   # Edit to your prefixes
-  TICKET_REGEX: '(?i)\b(?:PRD|OPS|JJ|FMS)-\d+\b'
+  TICKET_REGEX: '(PRD|OPS|JJ|FMS|BUG|TASK)-[0-9]+'
 
 jobs:
   validate:
     runs-on: ubuntu-latest
     steps:
-      - name: Validate title contains ticket and issue exists in Jira
+      - name: Check title/branch for ticket; verify in Jira; print status & assignee
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}       # e.g., https://your-domain.atlassian.net
-          JIRA_USER: ${{ secrets.JIRA_USER }}               # service account username (usually looks like an email)
-          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}     # API token created for that account
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}     # e.g., https://your-domain.atlassian.net
+          JIRA_USER: ${{ secrets.JIRA_USER }}             # service account username (usually an Atlassian email)
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}   # API token for that account
         run: |
           set -euo pipefail
 
+          # 1) Read title and branch from the PR payload
           PR_TITLE="$(jq -r '.pull_request.title' < "$GITHUB_EVENT_PATH")"
-          echo "PR title: $PR_TITLE"
+          PR_BRANCH="$(jq -r '.pull_request.head.ref' < "$GITHUB_EVENT_PATH")"
 
-          # Extract ticket key from PR title
-          if ! echo "$PR_TITLE" | grep -Po "$TICKET_REGEX" >/dev/null; then
-            echo "::error::No ticket key found in PR title. Expected something like PRD-1234 (regex: $TICKET_REGEX)"
+          echo "PR title : $PR_TITLE"
+          echo "PR branch: $PR_BRANCH"
+
+          # 2) Extract ticket from title; if not found, try branch
+          find_ticket() {
+            echo "$1" | grep -E -o -i "$TICKET_REGEX" | head -n1 || true
+          }
+
+          ISSUE_KEY="$(find_ticket "$PR_TITLE")"
+          if [[ -z "${ISSUE_KEY}" ]]; then
+            ISSUE_KEY="$(find_ticket "$PR_BRANCH")"
+          fi
+
+          if [[ -z "${ISSUE_KEY}" ]]; then
+            echo "::error::No ticket key found in PR title or branch name. Expected like PRD-1234 (regex: $TICKET_REGEX, case-insensitive)."
             exit 1
           fi
-          ISSUE_KEY="$(echo "$PR_TITLE" | grep -Po "$TICKET_REGEX" | head -n1 | tr '[:lower:]' '[:upper:]')"
+
+          # Normalize to uppercase
+          ISSUE_KEY="$(echo "$ISSUE_KEY" | tr '[:lower:]' '[:upper:]')"
           echo "Found ticket key: $ISSUE_KEY"
 
-          # Call Jira API
+          # 3) Call Jira to verify issue exists and fetch status/assignee
+          # Jira Cloud uses Basic auth: base64(username:api_token)
           AUTH="$(printf '%s' "${JIRA_USER}:${JIRA_API_TOKEN}" | base64)"
-          ISSUE_URL="${JIRA_BASE_URL}/rest/api/3/issue/${ISSUE_KEY}?fields=key,assignee"
+          ISSUE_URL="${JIRA_BASE_URL}/rest/api/3/issue/${ISSUE_KEY}?fields=key,summary,status,assignee"
 
           HTTP_CODE="$(curl -sS -w '%{http_code}' -o issue.json \
             -H "Authorization: Basic ${AUTH}" \
@@ -46,10 +62,28 @@ jobs:
             "$ISSUE_URL")"
 
           if [[ "$HTTP_CODE" != "200" ]]; then
-            echo "::error::Jira issue ${ISSUE_KEY} not found or API call failed (HTTP $HTTP_CODE)"
-            cat issue.json || true
+            if [[ "$HTTP_CODE" == "404" ]]; then
+              echo "::error::Jira issue ${ISSUE_KEY} not found."
+            else
+              echo "::error::Jira API returned HTTP ${HTTP_CODE} for ${ISSUE_KEY}"
+              cat issue.json || true
+            fi
             exit 1
           fi
 
-          ASSIGNEE_NAME="$(jq -r '.fields.assignee.displayName // "(unassigned)"' issue.json)"
-          echo "✅ Jira issue ${ISSUE_KEY} exists. Assignee: ${ASSIGNEE_NAME}"
+          # 4) Print status & assignee (info only)
+          SUMMARY="$(jq -r '.fields.summary // "(no summary)"' issue.json)"
+          STATUS="$(jq -r '.fields.status.name // "(no status)"' issue.json)"
+          ASSIGNEE_NAME="$(jq -r '.fields.assignee.displayName // "Unassigned"' issue.json)"
+          ASSIGNEE_EMAIL="$(jq -r '.fields.assignee.emailAddress // ""' issue.json)"
+
+          echo "::notice::Jira ticket: ${ISSUE_KEY}"
+          echo "::notice::Summary    : ${SUMMARY}"
+          echo "::notice::Status     : ${STATUS}"
+          if [[ -n "$ASSIGNEE_EMAIL" ]]; then
+            echo "::notice::Assignee   : ${ASSIGNEE_NAME} <${ASSIGNEE_EMAIL}>"
+          else
+            echo "::notice::Assignee   : ${ASSIGNEE_NAME}"
+          fi
+
+          echo "✅ Check passed: title/branch contains ${ISSUE_KEY} and Jira confirms it exists."
