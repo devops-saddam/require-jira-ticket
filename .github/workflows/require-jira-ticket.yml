@@ -1,21 +1,31 @@
-- name: Check title/branch for ticket; verify in Jira; print status & assignee
+- name: Check title/branch for ticket; verify in Jira; print status & assignee (debug)
   env:
+    TICKET_REGEX: ${{ env.TICKET_REGEX }}
     JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
     JIRA_USER: ${{ secrets.JIRA_USER }}
     JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
-    TICKET_REGEX: ${{ env.TICKET_REGEX }}
+    DEBUG: "true"   # set to "false" to reduce logs later
   run: |
     set -euo pipefail
 
-    # Guard rails: make sure secrets are present
+    mask() { # prints value length only
+      local v="$1"; [ -z "${v:-}" ] && { echo "(empty)"; return; }
+      echo "len=${#v}"
+    }
+
+    echo "::group::Inputs & sanity"
+    echo "JIRA_BASE_URL: ${JIRA_BASE_URL:-"(unset)"}"
+    echo "JIRA_USER    : $(mask "${JIRA_USER:-}")"
+    echo "JIRA_API_TOKEN: $(mask "${JIRA_API_TOKEN:-}")"
+
     if [[ -z "${JIRA_BASE_URL:-}" ]]; then echo "::error::JIRA_BASE_URL is not set"; exit 1; fi
     if [[ -z "${JIRA_USER:-}" ]]; then echo "::error::JIRA_USER is not set"; exit 1; fi
     if [[ -z "${JIRA_API_TOKEN:-}" ]]; then echo "::error::JIRA_API_TOKEN is not set"; exit 1; fi
     if [[ ! "$JIRA_BASE_URL" =~ ^https:// ]]; then echo "::warning::JIRA_BASE_URL should start with https://"; fi
+    echo "::endgroup::"
 
     PR_TITLE="$(jq -r '.pull_request.title' < "$GITHUB_EVENT_PATH")"
     PR_BRANCH="$(jq -r '.pull_request.head.ref' < "$GITHUB_EVENT_PATH")"
-
     echo "PR title : $PR_TITLE"
     echo "PR branch: $PR_BRANCH"
 
@@ -23,33 +33,80 @@
 
     ISSUE_KEY="$(find_ticket "$PR_TITLE")"
     if [[ -z "$ISSUE_KEY" ]]; then ISSUE_KEY="$(find_ticket "$PR_BRANCH")"; fi
-
     if [[ -z "$ISSUE_KEY" ]]; then
       echo "::error::No ticket key found in PR title or branch. Expected like PRD-1234 (regex: $TICKET_REGEX, case-insensitive)."
       exit 1
     fi
-
     ISSUE_KEY="$(echo "$ISSUE_KEY" | tr '[:lower:]' '[:upper:]')"
     echo "Found ticket key: $ISSUE_KEY"
 
-    ISSUE_URL="${JIRA_BASE_URL}/rest/api/3/issue/${ISSUE_KEY}?fields=key,summary,status,assignee"
-
-    # Use Basic auth with username:token
-    HTTP_CODE="$(curl -sS --fail -w '%{http_code}' -o issue.json \
+    # ---------- Quick auth probe (helps isolate 401/403/network issues) ----------
+    echo "::group::Auth probe (/rest/api/3/myself)"
+    set +e
+    PROBE_CODE="$(curl -sS -o probe.json -w '%{http_code}' \
       -u "${JIRA_USER}:${JIRA_API_TOKEN}" \
       -H 'Accept: application/json' \
-      "$ISSUE_URL" || true)"
+      --http1.1 \
+      "${JIRA_BASE_URL%/}/rest/api/3/myself")"
+    set -e
+    echo "Probe HTTP code: $PROBE_CODE"
+    if [[ "$PROBE_CODE" != "200" ]]; then
+      echo "::warning::Auth probe failed. Body:"
+      head -c 200 probe.json || true; echo
+    else
+      echo "Auth OK."
+    fi
+    echo "::endgroup::"
 
-    if [[ "$HTTP_CODE" != "200" ]]; then
-      if [[ "$HTTP_CODE" == "404" ]]; then
-        echo "::error::Jira issue ${ISSUE_KEY} not found (HTTP 404)."
-      else
-        echo "::error::Jira API call failed (HTTP ${HTTP_CODE:-unknown})."
-        cat issue.json || true
-      fi
-      exit 1
+    # ---------- Issue lookup with verbose diagnostics ----------
+    ISSUE_URL="${JIRA_BASE_URL%/}/rest/api/3/issue/${ISSUE_KEY}?fields=key,summary,status,assignee"
+    echo "Querying: $ISSUE_URL"
+
+    # We'll capture headers & a trace, then redact Authorization if present.
+    CURL_HEADERS="curl.headers.txt"
+    CURL_TRACE="curl.trace.txt"
+
+    set +e
+    HTTP_CODE="$(curl -sS \
+      -o issue.json \
+      -w '%{http_code}\nremote_ip=%{remote_ip}\nssl_verify=%{ssl_verify_result}\nsz=%{size_download}\n' \
+      -u "${JIRA_USER}:${JIRA_API_TOKEN}" \
+      -H 'Accept: application/json' \
+      --http1.1 \
+      --show-error \
+      --fail-with-body \
+      --dump-header "$CURL_HEADERS" \
+      --trace-ascii "$CURL_TRACE" \
+      "$ISSUE_URL")"
+    CURL_RC=$?
+    set -e
+
+    echo "::group::cURL result"
+    echo "curl exit code: $CURL_RC"
+    echo -e "$HTTP_CODE"
+    echo "::endgroup::"
+
+    # Always show headers & trace (with Authorization redacted)
+    echo "::group::Response headers"
+    sed -E 's/(Authorization: Basic )[A-Za-z0-9+\/=]+/\1[REDACTED]/I' "$CURL_HEADERS" || true
+    echo "::endgroup::"
+
+    if [[ "${DEBUG}" == "true" ]]; then
+      echo "::group::Trace (first 200 lines, Authorization redacted)"
+      sed -E 's/(Authorization: Basic )[A-Za-z0-9+\/=]+/\1[REDACTED]/I' "$CURL_TRACE" | head -n 200 || true
+      echo "::endgroup::"
     fi
 
+    # If curl failed, show body (if any) and exit with the same code
+    if [[ $CURL_RC -ne 0 ]]; then
+      echo "::group::Body (first 400 chars)"
+      head -c 400 issue.json || true; echo
+      echo "::endgroup::"
+      echo "::error::Jira request failed. See groups above for details."
+      exit $CURL_RC
+    fi
+
+    # Success path: parse and print details
     SUMMARY="$(jq -r '.fields.summary // "(no summary)"' issue.json)"
     STATUS="$(jq -r '.fields.status.name // "(no status)"' issue.json)"
     ASSIGNEE_NAME="$(jq -r '.fields.assignee.displayName // "Unassigned"' issue.json)"
