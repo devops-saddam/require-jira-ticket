@@ -3,17 +3,14 @@ name: Require Jira Ticket (title + assignee match)
 on:
   pull_request:
     types: [opened, edited, synchronize, reopened]
-  # Uncomment if using Merge Queue:
-  # merge_group:
+  # merge_group:  # uncomment if you use Merge Queue
 
 permissions:
   contents: read
   pull-requests: read
 
 env:
-  # Edit prefixes to your org (examples: PRD, OPS, JJ, FMS, BUG, TASK)
   TICKET_REGEX: '(?i)\\b(?:PRD|OPS|JJ|FMS|BUG|TASK)-\\d+\\b'
-  # If you use a mapping fallback file, keep the path here:
   JIRA_MAP_FILE: '.github/jira-map.json'
 
 jobs:
@@ -31,14 +28,12 @@ jobs:
           JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
         with:
           script: |
-            const core = require('@actions/core');
-
-            // ---------- Helpers ----------
+            // NOTE: core, github, context are provided by github-script. Don't redeclare/require them.
             const ticketRegex = new RegExp(process.env.TICKET_REGEX, 'i');
             const pr = context.payload.pull_request;
             const title = pr.title || '';
 
-            // 1) Extract ticket key from PR title
+            // 1) Ticket in PR title
             const match = title.match(ticketRegex);
             if (!match) {
               core.setFailed(`No ticket key found in PR title. Title must contain a key matching \`${process.env.TICKET_REGEX}\` (e.g., PRD-1234).`);
@@ -47,15 +42,13 @@ jobs:
             const issueKey = match[0].toUpperCase();
             core.info(`Found ticket key: ${issueKey}`);
 
-            // 2) Determine PR author email
-            // GitHub doesn't expose a reliable "PR author email". We infer from commit emails in this PR.
+            // 2) Infer PR author email from commits (skip noreply)
             const commits = await github.paginate(github.pulls.listCommits, {
               owner: context.repo.owner,
               repo: context.repo.repo,
               pull_number: pr.number,
               per_page: 100
             });
-
             const emailSet = new Set();
             for (const c of commits) {
               const a = c.commit?.author?.email?.toLowerCase();
@@ -63,28 +56,24 @@ jobs:
               if (a && !a.endsWith('@users.noreply.github.com')) emailSet.add(a);
               if (m && !m.endsWith('@users.noreply.github.com')) emailSet.add(m);
             }
-
             if (emailSet.size === 0) {
               core.setFailed(
                 "Couldn't determine a real email from PR commits (only noreply emails found). " +
-                "Please ensure at least one commit uses your corporate email, or add one new commit with correct email."
+                "Add a commit using your corporate email or amend/squash to fix."
               );
               return;
             }
-
             if (emailSet.size > 1) {
               core.setFailed(
-                `Multiple distinct author/committer emails found in PR commits: ${Array.from(emailSet).join(', ')}. ` +
-                `Please squash or amend so a single consistent email is used.`
+                `Multiple author/committer emails in this PR: ${Array.from(emailSet).join(', ')}. ` +
+                `Please unify (squash/amend) so a single email remains.`
               );
               return;
             }
-
             const prEmail = Array.from(emailSet)[0];
-            core.info(`PR author email inferred from commits: ${prEmail}`);
+            core.info(`PR author email inferred: ${prEmail}`);
 
-            // 3) Query Jira for issue + assignee
-            const fetch = require('node-fetch');
+            // 3) Call Jira (Node 20 global fetch)
             const auth = Buffer.from(`${process.env.JIRA_EMAIL}:${process.env.JIRA_API_TOKEN}`).toString('base64');
             const url = `${process.env.JIRA_BASE_URL}/rest/api/3/issue/${encodeURIComponent(issueKey)}?fields=summary,assignee`;
 
@@ -113,18 +102,18 @@ jobs:
             const data = await resp.json();
             const fields = data.fields || {};
             const assignee = fields.assignee || {};
-            const jiraEmail = (assignee.emailAddress || '').toLowerCase(); // may be empty due to privacy
+            const jiraEmail = (assignee.emailAddress || '').toLowerCase(); // may be blank if hidden
             const jiraDisplay = assignee.displayName || '(no name)';
             const jiraAccountId = assignee.accountId || '';
 
             core.info(`Jira assignee: ${jiraDisplay}${jiraEmail ? ` <${jiraEmail}>` : ''}${jiraAccountId ? ` [${jiraAccountId}]` : ''}`);
 
-            // 4) Compare emails (primary path)
+            // 4) Primary: compare emails
             if (jiraEmail) {
               if (jiraEmail !== prEmail) {
                 core.setFailed(
                   `PR author email (${prEmail}) does not match Jira assignee email (${jiraEmail}) on ${issueKey}. ` +
-                  `Update the assignee in Jira or ensure commits use the assignee's email.`
+                  `Update Jira assignee or ensure commits use the assignee's email.`
                 );
                 return;
               }
@@ -132,13 +121,8 @@ jobs:
               return;
             }
 
-            // 5) Fallback: Jira email hidden — try optional mapping file .github/jira-map.json
-            // Format:
-            // {
-            //   "byGithubEmail": { "dev@example.com": "5f8a1234abcd..." },
-            //   "byGithubLogin": { "octocat": "5f8a1234abcd..." }
-            // }
-            const fs = require('fs');
+            // 5) Fallback: mapping file if Jira hides emails
+            const fs = await import('node:fs');
             const mapPath = process.env.JIRA_MAP_FILE;
             let mapped = false;
 
@@ -147,14 +131,12 @@ jobs:
                 const raw = fs.readFileSync(mapPath, 'utf8');
                 const map = JSON.parse(raw);
 
-                // Try by GitHub commit email
                 const byEmail = map.byGithubEmail || {};
                 if (byEmail[prEmail] && byEmail[prEmail] === jiraAccountId) {
                   core.info('✅ Mapped PR email to Jira accountId via mapping file. Passing.');
                   mapped = true;
                 }
 
-                // Try by GitHub login (as a secondary fallback)
                 if (!mapped) {
                   const ghLogin = pr.user?.login;
                   const byLogin = map.byGithubLogin || {};
@@ -170,9 +152,8 @@ jobs:
 
             if (!mapped) {
               core.setFailed(
-                `Jira did not expose assignee email for ${issueKey}, and no mapping matched. ` +
-                `Either enable assignee emails in Jira, or add a mapping in ${mapPath}:\n\n` +
+                `Jira didn't expose assignee email for ${issueKey}, and no mapping matched.\n` +
+                `Enable Jira emails or add a mapping in ${mapPath} like:\n` +
                 `{\n  "byGithubEmail": { "${prEmail}": "${jiraAccountId}" },\n  "byGithubLogin": { "${pr.user?.login}": "${jiraAccountId}" }\n}\n`
               );
-              return;
             }
