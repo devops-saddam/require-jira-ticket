@@ -19,7 +19,8 @@ jobs:
       - name: Validate ticket exists in Jira
         env:
           JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}   # e.g., https://jira.company.com
-          JIRA_PAT: ${{ secrets.JIRA_API_TOKEN }}             # Bearer token
+          #JIRA_PAT: ${{ secrets.JIRA_API_TOKEN }}    
+          JIRA_PAT: ${{ vars.JIRA_BASE_URL }} # Bearer token
         run: |
           set -euo pipefail
 
