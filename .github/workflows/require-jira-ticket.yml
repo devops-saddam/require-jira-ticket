@@ -3,14 +3,13 @@ name: Require Jira Ticket (simple)
 on:
   pull_request:
     types: [opened, edited, synchronize, reopened]
-  # merge_group:  # uncomment if you use Merge Queue
 
 permissions:
   contents: read
   pull-requests: read
 
 env:
-  # Edit to your prefixes: PRD, OPS, JJ, FMS, etc.
+  # Edit to your prefixes
   TICKET_REGEX: '(?i)\b(?:PRD|OPS|JJ|FMS)-\d+\b'
 
 jobs:
@@ -20,17 +19,16 @@ jobs:
       - name: Validate title contains ticket and issue exists in Jira
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}     # e.g., https://your-domain.atlassian.net
-          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}           # Jira user email for API token
-          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}   # Jira API token
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}       # e.g., https://your-domain.atlassian.net
+          JIRA_USER: ${{ secrets.JIRA_USER }}               # service account username (usually looks like an email)
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}     # API token created for that account
         run: |
           set -euo pipefail
 
-          # --- Read PR title
           PR_TITLE="$(jq -r '.pull_request.title' < "$GITHUB_EVENT_PATH")"
           echo "PR title: $PR_TITLE"
 
-          # --- Extract first ticket key from title
+          # Extract ticket key from PR title
           if ! echo "$PR_TITLE" | grep -Po "$TICKET_REGEX" >/dev/null; then
             echo "::error::No ticket key found in PR title. Expected something like PRD-1234 (regex: $TICKET_REGEX)"
             exit 1
@@ -38,13 +36,9 @@ jobs:
           ISSUE_KEY="$(echo "$PR_TITLE" | grep -Po "$TICKET_REGEX" | head -n1 | tr '[:lower:]' '[:upper:]')"
           echo "Found ticket key: $ISSUE_KEY"
 
-          # --- Call Jira to verify issue exists (and fetch assignee info)
-          AUTH="$(printf '%s' "${JIRA_EMAIL}:${JIRA_API_TOKEN}" | base64)"
-          ISSUE_URL="${JIRA_BASE_URL}/rest/api/3/issue/$(python3 - <<EOF
-import urllib.parse,sys
-print(urllib.parse.quote(sys.argv[1]))
-EOF
-"${ISSUE_KEY}")?fields=key,summary,assignee"
+          # Call Jira API
+          AUTH="$(printf '%s' "${JIRA_USER}:${JIRA_API_TOKEN}" | base64)"
+          ISSUE_URL="${JIRA_BASE_URL}/rest/api/3/issue/${ISSUE_KEY}?fields=key,assignee"
 
           HTTP_CODE="$(curl -sS -w '%{http_code}' -o issue.json \
             -H "Authorization: Basic ${AUTH}" \
@@ -52,24 +46,10 @@ EOF
             "$ISSUE_URL")"
 
           if [[ "$HTTP_CODE" != "200" ]]; then
-            if [[ "$HTTP_CODE" == "404" ]]; then
-              echo "::error::Jira issue ${ISSUE_KEY} not found."
-            else
-              echo "::error::Jira API returned HTTP ${HTTP_CODE} for ${ISSUE_KEY}"
-              cat issue.json || true
-            fi
+            echo "::error::Jira issue ${ISSUE_KEY} not found or API call failed (HTTP $HTTP_CODE)"
+            cat issue.json || true
             exit 1
           fi
 
-          # --- (Info) Show assignee
           ASSIGNEE_NAME="$(jq -r '.fields.assignee.displayName // "(unassigned)"' issue.json)"
-          echo "Jira issue ${ISSUE_KEY} exists. Assignee: ${ASSIGNEE_NAME}"
-
-          # --- Optional sanity: ensure Jira echoed same key
-          JIRA_KEY="$(jq -r '.key' issue.json | tr '[:lower:]' '[:upper:]')"
-          if [[ "$JIRA_KEY" != "$ISSUE_KEY" ]]; then
-            echo "::error::Jira returned key '$JIRA_KEY' which doesn't match title key '$ISSUE_KEY'."
-            exit 1
-          fi
-
-          echo "✅ Check passed: title contains ${ISSUE_KEY} and Jira confirms it exists."
+          echo "✅ Jira issue ${ISSUE_KEY} exists. Assignee: ${ASSIGNEE_NAME}"
