@@ -46,6 +46,11 @@ jobs:
 
           ISSUE_URL="${JIRA_BASE_URL%/}/rest/api/3/issue/${ISSUE_KEY}?fields=key,summary,status,assignee"
 
+          # Print URLs for debugging
+          echo "Using JIRA_BASE_URL: $JIRA_BASE_URL"
+          echo "Constructed ISSUE_URL: $ISSUE_URL"
+
+          # Call Jira API
           HTTP_CODE="$(curl -sS -o issue.json -w '%{http_code}' \
             -H "Authorization: Bearer ${JIRA_PAT}" \
             -H "Accept: application/json" \
