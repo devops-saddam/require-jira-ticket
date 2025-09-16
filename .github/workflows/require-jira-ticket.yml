@@ -1,4 +1,4 @@
-name: Require Jira Ticket (title + assignee match)
+name: Require Jira Ticket (simple)
 
 on:
   pull_request:
@@ -10,150 +10,66 @@ permissions:
   pull-requests: read
 
 env:
-  TICKET_REGEX: '(?i)\\b(?:PRD|OPS|JJ|FMS|BUG|TASK)-\\d+\\b'
-  JIRA_MAP_FILE: '.github/jira-map.json'
+  # Edit to your prefixes: PRD, OPS, JJ, FMS, etc.
+  TICKET_REGEX: '(?i)\b(?:PRD|OPS|JJ|FMS)-\d+\b'
 
 jobs:
   validate:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout (for optional mapping file)
-        uses: actions/checkout@v4
-
-      - name: Validate PR has ticket and Jira assignee matches PR author
-        uses: actions/github-script@v7
+      - name: Validate title contains ticket and issue exists in Jira
         env:
-          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
-          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
-          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
-        with:
-          script: |
-            // NOTE: core, github, context are provided by github-script. Don't redeclare/require them.
-            const ticketRegex = new RegExp(process.env.TICKET_REGEX, 'i');
-            const pr = context.payload.pull_request;
-            const title = pr.title || '';
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}     # e.g., https://your-domain.atlassian.net
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}           # Jira user email for API token
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}   # Jira API token
+        run: |
+          set -euo pipefail
 
-            // 1) Ticket in PR title
-            const match = title.match(ticketRegex);
-            if (!match) {
-              core.setFailed(`No ticket key found in PR title. Title must contain a key matching \`${process.env.TICKET_REGEX}\` (e.g., PRD-1234).`);
-              return;
-            }
-            const issueKey = match[0].toUpperCase();
-            core.info(`Found ticket key: ${issueKey}`);
+          # --- Read PR title
+          PR_TITLE="$(jq -r '.pull_request.title' < "$GITHUB_EVENT_PATH")"
+          echo "PR title: $PR_TITLE"
 
-            // 2) Infer PR author email from commits (skip noreply)
-            const commits = await github.paginate(github.pulls.listCommits, {
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pull_number: pr.number,
-              per_page: 100
-            });
-            const emailSet = new Set();
-            for (const c of commits) {
-              const a = c.commit?.author?.email?.toLowerCase();
-              const m = c.commit?.committer?.email?.toLowerCase();
-              if (a && !a.endsWith('@users.noreply.github.com')) emailSet.add(a);
-              if (m && !m.endsWith('@users.noreply.github.com')) emailSet.add(m);
-            }
-            if (emailSet.size === 0) {
-              core.setFailed(
-                "Couldn't determine a real email from PR commits (only noreply emails found). " +
-                "Add a commit using your corporate email or amend/squash to fix."
-              );
-              return;
-            }
-            if (emailSet.size > 1) {
-              core.setFailed(
-                `Multiple author/committer emails in this PR: ${Array.from(emailSet).join(', ')}. ` +
-                `Please unify (squash/amend) so a single email remains.`
-              );
-              return;
-            }
-            const prEmail = Array.from(emailSet)[0];
-            core.info(`PR author email inferred: ${prEmail}`);
+          # --- Extract first ticket key from title
+          if ! echo "$PR_TITLE" | grep -Po "$TICKET_REGEX" >/dev/null; then
+            echo "::error::No ticket key found in PR title. Expected something like PRD-1234 (regex: $TICKET_REGEX)"
+            exit 1
+          fi
+          ISSUE_KEY="$(echo "$PR_TITLE" | grep -Po "$TICKET_REGEX" | head -n1 | tr '[:lower:]' '[:upper:]')"
+          echo "Found ticket key: $ISSUE_KEY"
 
-            // 3) Call Jira (Node 20 global fetch)
-            const auth = Buffer.from(`${process.env.JIRA_EMAIL}:${process.env.JIRA_API_TOKEN}`).toString('base64');
-            const url = `${process.env.JIRA_BASE_URL}/rest/api/3/issue/${encodeURIComponent(issueKey)}?fields=summary,assignee`;
+          # --- Call Jira to verify issue exists (and fetch assignee info)
+          AUTH="$(printf '%s' "${JIRA_EMAIL}:${JIRA_API_TOKEN}" | base64)"
+          ISSUE_URL="${JIRA_BASE_URL}/rest/api/3/issue/$(python3 - <<EOF
+import urllib.parse,sys
+print(urllib.parse.quote(sys.argv[1]))
+EOF
+"${ISSUE_KEY}")?fields=key,summary,assignee"
 
-            let resp;
-            try {
-              resp = await fetch(url, {
-                headers: {
-                  'Authorization': `Basic ${auth}`,
-                  'Accept': 'application/json'
-                }
-              });
-            } catch (e) {
-              core.setFailed(`Failed to reach Jira: ${e.message}`);
-              return;
-            }
+          HTTP_CODE="$(curl -sS -w '%{http_code}' -o issue.json \
+            -H "Authorization: Basic ${AUTH}" \
+            -H "Accept: application/json" \
+            "$ISSUE_URL")"
 
-            if (resp.status === 404) {
-              core.setFailed(`Jira issue **${issueKey}** not found.`);
-              return;
-            }
-            if (!resp.ok) {
-              core.setFailed(`Jira API returned HTTP ${resp.status} for ${issueKey}.`);
-              return;
-            }
+          if [[ "$HTTP_CODE" != "200" ]]; then
+            if [[ "$HTTP_CODE" == "404" ]]; then
+              echo "::error::Jira issue ${ISSUE_KEY} not found."
+            else
+              echo "::error::Jira API returned HTTP ${HTTP_CODE} for ${ISSUE_KEY}"
+              cat issue.json || true
+            fi
+            exit 1
+          fi
 
-            const data = await resp.json();
-            const fields = data.fields || {};
-            const assignee = fields.assignee || {};
-            const jiraEmail = (assignee.emailAddress || '').toLowerCase(); // may be blank if hidden
-            const jiraDisplay = assignee.displayName || '(no name)';
-            const jiraAccountId = assignee.accountId || '';
+          # --- (Info) Show assignee
+          ASSIGNEE_NAME="$(jq -r '.fields.assignee.displayName // "(unassigned)"' issue.json)"
+          echo "Jira issue ${ISSUE_KEY} exists. Assignee: ${ASSIGNEE_NAME}"
 
-            core.info(`Jira assignee: ${jiraDisplay}${jiraEmail ? ` <${jiraEmail}>` : ''}${jiraAccountId ? ` [${jiraAccountId}]` : ''}`);
+          # --- Optional sanity: ensure Jira echoed same key
+          JIRA_KEY="$(jq -r '.key' issue.json | tr '[:lower:]' '[:upper:]')"
+          if [[ "$JIRA_KEY" != "$ISSUE_KEY" ]]; then
+            echo "::error::Jira returned key '$JIRA_KEY' which doesn't match title key '$ISSUE_KEY'."
+            exit 1
+          fi
 
-            // 4) Primary: compare emails
-            if (jiraEmail) {
-              if (jiraEmail !== prEmail) {
-                core.setFailed(
-                  `PR author email (${prEmail}) does not match Jira assignee email (${jiraEmail}) on ${issueKey}. ` +
-                  `Update Jira assignee or ensure commits use the assignee's email.`
-                );
-                return;
-              }
-              core.info('✅ Emails match Jira assignee. Passing.');
-              return;
-            }
-
-            // 5) Fallback: mapping file if Jira hides emails
-            const fs = await import('node:fs');
-            const mapPath = process.env.JIRA_MAP_FILE;
-            let mapped = false;
-
-            if (fs.existsSync(mapPath)) {
-              try {
-                const raw = fs.readFileSync(mapPath, 'utf8');
-                const map = JSON.parse(raw);
-
-                const byEmail = map.byGithubEmail || {};
-                if (byEmail[prEmail] && byEmail[prEmail] === jiraAccountId) {
-                  core.info('✅ Mapped PR email to Jira accountId via mapping file. Passing.');
-                  mapped = true;
-                }
-
-                if (!mapped) {
-                  const ghLogin = pr.user?.login;
-                  const byLogin = map.byGithubLogin || {};
-                  if (ghLogin && byLogin[ghLogin] && byLogin[ghLogin] === jiraAccountId) {
-                    core.info('✅ Mapped PR login to Jira accountId via mapping file. Passing.');
-                    mapped = true;
-                  }
-                }
-              } catch (e) {
-                core.warning(`Failed to read/parse ${mapPath}: ${e.message}`);
-              }
-            }
-
-            if (!mapped) {
-              core.setFailed(
-                `Jira didn't expose assignee email for ${issueKey}, and no mapping matched.\n` +
-                `Enable Jira emails or add a mapping in ${mapPath} like:\n` +
-                `{\n  "byGithubEmail": { "${prEmail}": "${jiraAccountId}" },\n  "byGithubLogin": { "${pr.user?.login}": "${jiraAccountId}" }\n}\n`
-              );
-            }
+          echo "✅ Check passed: title contains ${ISSUE_KEY} and Jira confirms it exists."
