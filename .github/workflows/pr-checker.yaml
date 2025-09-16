@@ -18,7 +18,8 @@ jobs:
           BRANCH_NAME="${{ github.head_ref || github.ref_name }}"
           echo "PR_TITLE=$PR_TITLE"
           echo "BRANCH_NAME=$BRANCH_NAME"
-          TICKET=$(echo "$PR_TITLE $BRANCH_NAME" | grep -oE '[A-Z]+-[0-9]+' | head -n1)
+          # TICKET=$(echo "$PR_TITLE $BRANCH_NAME" | grep -oE '[A-Z]+-[0-9]+' | head -n1)
+          TICKET=$(echo "$PR_TITLE $BRANCH_NAME" | grep -oE '[A-Za-z]+-[0-9]+' | head -n1 | tr '[:lower:]' '[:upper:]')
           if [[ -z "$TICKET" ]]; then
             echo "No JIRA ticket found in PR title or branch name."
             exit 1
